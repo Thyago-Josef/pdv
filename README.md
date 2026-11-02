@@ -1,10 +1,16 @@
-# PDV - Sistema de Sincronização Multi-tenant
+# PDV - Sistema de Sincronizacao Multi-tenant
 
-## Visão Geral
+## Visao Geral
 
-Sistema PDV SaaS multi-tenant com isolamento via **Row Level Security (RLS)** do PostgreSQL e autenticação **JWT (OAuth2 Resource Server)**.  
-O `tenant_id` é extraído **exclusivamente do claim `tenant_id`** do JWT, nunca do corpo da requisição.  
-Toda a aplicação utiliza **JdbcTemplate** (sem JPA). Banco: **PostgreSQL 16**.
+Backend Spring Boot de PDV SaaS multi-tenant com **um banco PostgreSQL por tenant**.
+
+Arquitetura:
+1. **Banco de Controle** (unico, nosso): guarda tenants e o mapeamento tenant -> banco.
+2. **Banco por Tenant**: contem lojas, caixas, vendas, etc. Varias lojas por banco.
+
+O `tenant_id` vem exclusivamente do claim `tenant_id` do JWT. O Spring resolve o banco do tenant
+a partir do banco de controle. Nunca aceitar `tenant_id`, loja de outro tenant ou nome de banco
+vindos do corpo, query ou header da requisicao.
 
 ## Tecnologias
 
@@ -14,229 +20,115 @@ Toda a aplicação utiliza **JdbcTemplate** (sem JPA). Banco: **PostgreSQL 16**.
 - Spring JDBC (JdbcTemplate)
 - PostgreSQL 16
 - Flyway
-- Testcontainers (testes de integração)
+- Testcontainers (testes de integracao)
 
-## Arquitetura de Isolamento
+## Arquitetura
 
-### 1) Papéis de banco
-- **`pdv`** - Dono das tabelas. Utilizado pelo **Flyway** para executar migrações.
-- **`pdv_app`** - Role da aplicação. `LOGIN`, `NOSUPERUSER`, `NOBYPASSRLS`. Sem privilégios para ignorar RLS. Usado pelo `spring.datasource` da aplicação.
+### 1) Banco de Controle (`db/control`)
 
-### 2) Row Level Security (RLS)
-Todas as tabelas multi-tenant possuem **`ENABLE ROW LEVEL SECURITY`** e **`FORCE ROW LEVEL SECURITY`**:
-- `venda`
-- `venda_item`
-- `venda_pagamento`
-- `loja`
-- `caixa`
+Migration: `V1__tenant.sql`
 
-As políticas utilizam:
-```sql
-tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
-```
-com **`USING`** e **`WITH CHECK`**.  
-Caso `app.tenant_id` não esteja definido, `NULLIF` retorna `NULL` e a política filtra **zero linhas** (sem erro de cast).
+Tabela `tenant`:
+- `id` UUID PK
+- `nome` VARCHAR(255)
+- `status` VARCHAR(20) CHECK (ATIVO|SUSPENSO)
+- `db_host`, `db_port`, `db_name`, `db_user`, `db_password_enc` BYTEA
+- `criado_em` TIMESTAMPTZ
 
-Dentro de cada transação da sincronização, o serviço executa:
-```sql
-SELECT set_config('app.tenant_id', ?, true)
-```
+`db_password_enc`: senha do usuario de aplicacao daquele banco, criptografada com AES-GCM;
+chave mestra via variavel de ambiente `MASTER_KEY` (falhar na inicializacao se ausente ou < 32 bytes).
 
-### 3) Chave composta e integridade
-- `venda` possui **chave primária composta** `(tenant_id, id)`. O `id` é gerado no cliente (garante idempotência).
-- `venda_item` e `venda_pagamento` possuem `tenant_id` NOT NULL, preenchido na migration a partir de `venda`, com **FKs compostas** `(tenant_id, venda_id)` referenciando `(tenant_id, id)` de `venda`.
-- `loja` e `caixa` possuem PK composta `(tenant_id, id)` e FKs coerentes com o tenant.
-- **Idempotência**: `INSERT ... ON CONFLICT (tenant_id, id) DO NOTHING`. Mesmo UUID enviado por **tenants diferentes** resulta em **vendas separadas e ambas ACEITAS**.
+### 2) Banco por Tenant (`db/tenant`)
 
-## Autenticação e Emissão de Token
+Migration: `V1__baseline.sql`
 
-### Perfis
-- **Padrão (produção)**: `POST /api/auth/**` é negado. O endpoint de emissão **não existe**.
-- **dev**: Ative com `spring.profiles.active=dev`. `POST /api/auth/token` liberado apenas neste perfil.
+Tabelas:
+- `loja` (id, nome, fuso, ativa)
+- `caixa` (id, loja_id FK loja, nome)
+- `venda` (id PK, tenant_id, loja_id FK loja, caixa_id FK caixa, criada_em, recebida_em, total_centavos)
+- `venda_item` (venda_id FK, tenant_id, produto_id, quantidade, preco_centavos)
+- `venda_pagamento` (venda_id FK, tenant_id, forma, valor_centavos)
+- `usuario_loja` (usuario_id, loja_id)
+- `venda_resumo_dia` (opcional/TODO)
 
-> **CRÍTICO - SOMENTE DESENVOLVIMENTO**  
-> O endpoint `POST /api/auth/token` aceita `tenantId` (e opcionalmente `lojaId`) no corpo e emite um token JWT assinado. **Qualquer pessoa com acesso a ele pode gerar token para qualquer tenant**.  
-> Em **produção**, a emissão deve vir de um **login real (usuário e senha)**. O `tenant_id` **deve vir do cadastro do usuário no banco de dados**, **nunca** enviado pelo cliente.  
-> TODO: implementar login real com credenciais e obter tenant a partir do usuário autenticado. TODO: refresh token.
+Sem RLS neste banco.
 
-### Gerar token (apenas dev)
-**Endpoint:** `POST /api/auth/token`
+### 3) Roteamento por Tenant
 
-**Request Body:**
-```json
-{
-  "tenantId": "e7a62f43-9b82-4c02-b7e2-2f3ab9e8c902",
-  "lojaId": "c9a62b43-8f72-4e02-b7c1-2ab8e9f70213"
-}
-```
-`lojaId` é opcional. Se informado, será gravado como claim `loja_id` no JWT.
+- `TenantContext` (ThreadLocal) com set/clear/get.
+- `TenantRoutingDataSource` (implementa DataSource) com pool HikariCP por tenant (max 5 conexoes).
+- `TenantContextFilter` (OncePerRequestFilter) preenche o TenantContext a partir do claim
+  `tenant_id` do JWT e limpa no `finally`.
+- Tenant inexistente ou SUSPENSO -> 403 e nenhuma conexao aberta.
+- JdbcTemplate dos services passa a usar o DataSource roteado.
 
-**Response:**
-```json
-{
-  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "tokenType": "Bearer",
-  "expiresIn": 3600
-}
-```
+### 4) Autenticacao e Emissao de Token
 
-### Claims do JWT
-- `iss` - issuer (`jwt.issuer`)
-- `iat` - emissão
-- `exp` - expiração (+1 hora)
-- `sub` - `tenant_id`
-- `tenant_id` - UUID do tenant (obrigatório)
-- `loja_id` - UUID da loja (opcional, apenas em dev)
+- `POST /api/auth/token` (somente `@Profile("dev")`).
+- Recebe `tenantId`, `perfil` (ADMIN|GERENTE|OPERADOR) e `lojas` (lista de UUIDs), emite JWT com
+  claims `tenant_id`, `perfil`, `lojas`, e opcionalmente `loja_id`/`caixa_id` para OPERADOR.
+- Em producao o token vem de login real (usuário e senha); tenant e escopo vêm do cadastro do usuário.
 
-### Validação
-- Assinado com **HS256** usando `jwt.secret`
-- `jwt.secret` **obrigatório via variável de ambiente** e deve ter **>= 32 bytes**. A aplicação falha na inicialização caso inválido.
-- Rotas protegidas exigem `Authorization: Bearer <accessToken>`
-- Sessão **stateless**
+### 5) Sincronizacao de Vendas
 
-## Sincronização de Vendas
+`POST /api/v1/sync/vendas` - contrato de DTO inalterado.
 
-**Endpoint:** `POST /api/v1/sync/vendas`
+Status: `ACEITA | DUPLICADA | REJEITADA`.
 
-**Headers:**
-```
-Authorization: Bearer <accessToken>
-Content-Type: application/json
-```
+Regras de validacao:
+- ao menos 1 item; quantidade > 0; valores >= 0; total recalculado igual ao informado; pagamento >= total.
+- loja deve existir no banco do tenant; caixa deve pertencer a loja.
+- OPERADOR enviando loja/caixa diferente do token -> REJEITADA.
+- GERENTE enviando loja fora da lista `lojas` do token -> REJEITADA.
 
-**Request Body (contrato inalterado):**
-```json
-{
-  "vendas": [
-    {
-      "id": "b7f3e8a2-9c42-4d02-b8e1-2ab7c9f80321",
-      "lojaId": "c9a62b43-8f72-4e02-b7c1-2ab8e9f70213",
-      "caixaId": "a7b82c43-9e62-4f02-b8a1-2c7ab9e80342",
-      "criadaEm": "2026-11-01T10:30:00Z",
-      "totalCentavos": 15000,
-      "itens": [
-        {
-          "produtoId": "d8a72b43-9c62-4e02-b7f1-2ab9c8e70321",
-          "quantidade": 2,
-          "precoCentavos": 7500
-        }
-      ],
-      "pagamentos": [
-        {
-          "forma": "DINHEIRO",
-          "valorCentavos": 15000
-        }
-      ]
-    }
-  ]
-}
-```
+Idempotencia por PK (id) dentro do banco do tenant: reenvio devolve `DUPLICADA`.
 
-**Response:**
-```json
-{
-  "resultados": [
-    {
-      "id": "b7f3e8a2-9c42-4d02-b8e1-2ab7c9f80321",
-      "status": "ACEITA",
-      "motivo": null
-    }
-  ]
-}
-```
+### 6) Relatorios
 
-### Regras de validação
-- `vendas` processadas em lote
-- **Valores em centavos (long)**
-- **Deve ter ao menos 1 item** - senão `REJEITADA` ("venda sem itens")
-- **Quantidades > 0** - senão `REJEITADA` ("quantidade inválida")
-- **Valores >= 0** - senão `REJEITADA` ("preco inválido" / "pagamento inválido")
-- **Deve ter ao menos 1 pagamento** - senão `REJEITADA` ("sem pagamentos")
-- **Total recalculado**: soma `(quantidade * precoCentavos)` deve igualar `totalCentavos` - senão `REJEITADA` ("total divergente: esperado ...")
-- **Pagamento >= total** - senão `REJEITADA` ("pagamento menor que o total")
-- **Loja deve pertencer ao tenant do token** - senão `REJEITADA` ("loja não pertence ao tenant")
-- **Caixa deve pertencer à loja e ao tenant** - senão `REJEITADA` ("caixa não pertence à loja/tenant")
-- **Se JWT possuir `loja_id`**, a `lojaId` da venda **deve ser igual** - senão `REJEITADA` ("loja divergente do token")
+- `GET /api/v1/relatorios/vendas?lojaId=<uuid>&de=<iso>&ate=<iso>`
+- `GET /api/v1/relatorios/vendas?lojas=todas&de=<iso>&ate=<iso>`
 
-### Status
-- `ACEITA` - Venda gravada com sucesso
-- `DUPLICADA` - Já existe venda com `(tenant_id, id)`. **Não duplica** `venda`, `venda_item` ou `venda_pagamento`. Cliente pode marcar como enviada.
-- `REJEITADA` - Falha de validação. `motivo` descreve o motivo.
+Escopo aplicado no servidor: "todas" = lojas permitidas ao usuario (ADMIN = todas do tenant;
+GERENTE = as do claim `lojas`; OPERADOR = apenas a propria). lojaId fora do escopo -> 403.
 
-## Regras de Isolamento: Tenant x Loja
+### 7) Remocao de RLS
 
-O limite efetivo de isolamento é o **`tenant_id` do JWT** (aplicado via RLS).  
-`loja_id` e `caixa_id` são apenas organizacionais dentro do tenant.
+RLS foi removido. Isolamento via banco por tenant + validacoes no sync.
 
-| Cenário | Configuração | Comportamento |
+## Configuracao
+
+### Variaveis de ambiente
+
+| Variavel | Descricao | Padrao |
 |---|---|---|
-| **1 tenant por loja** | Cada loja com `tenant_id` único e token próprio | Isolamento total entre lojas. |
-| **1 tenant por empresa/rede** | Todas as lojas compartilham o mesmo `tenant_id` | Isolamento por empresa. Diferenciar por `loja_id`/`caixa_id`. Relatórios por loja funcionam normalmente. |
+| `JWT_SECRET` | Chave para assinar/verificar JWT HS256 (min 32 bytes) | vazio (dev usa default) |
+| `MASTER_KEY` | Chave mestra AES-GCM (control) | - |
+| `CONTROL_DB_URL` | JDBC do banco de controle | jdbc:postgresql://localhost:5440/pdv_control |
+| `CONTROL_DB_USER` / `CONTROL_DB_PASSWORD` | Credenciais admin de provisionamento | postgres / postgres |
+| `PDV_APP_PASSWORD` | Senha do role `pdv_app` do tenant | pdv_app |
+| `PDV_FLYWAY_USER` / `PDV_FLYWAY_PASSWORD` | Usuarios Flyway | pdv / pdv |
 
-Quem emite tokens define o modelo. Com PK composta `(tenant_id, id)`, **mesmo UUID de venda não causa colisão entre tenants**.
-
-## Configuração
-
-### Variáveis de ambiente
-| Variável | Obrigatório | Padrão | Descrição |
-|---|---|---|---|
-| `JWT_SECRET` | Sim (produção) | vazio (dev pode usar valor padrão) | Chave para assinar/verificar JWT HS256. **Mínimo 32 bytes**. |
-| `PDV_APP_PASSWORD` | Recomendado | `pdv_app` | Senha do role `pdv_app`. |
-| `PDV_FLYWAY_PASSWORD` | Recomendado | `pdv` | Senha do usuário dono `pdv` (usado pelo Flyway). |
-
-### application.properties (padrão / produção)
-```properties
-spring.application.name=pdv
-
-# Datasource - aplicação usa role sem bypass RLS
-spring.datasource.url=jdbc:postgresql://localhost:5440/pdv
-spring.datasource.username=pdv_app
-spring.datasource.password=${PDV_APP_PASSWORD:pdv_app}
-
-# Flyway - migra com usuário dono das tabelas
-spring.flyway.enabled=true
-spring.flyway.user=pdv
-spring.flyway.password=${PDV_FLYWAY_PASSWORD:pdv}
-
-# JWT
-jwt.secret=${JWT_SECRET:}
-jwt.issuer=pdv
-```
+### application.properties (padrao / producao)
+...
 
 ### application-dev.properties (desenvolvimento)
-```properties
-# Ativar com: --spring.profiles.active=dev
-# POST /api/auth/token só existe com perfil dev
-spring.datasource.url=jdbc:postgresql://localhost:5440/pdv
-spring.datasource.username=pdv_app
-spring.datasource.password=${PDV_APP_PASSWORD:pdv_app}
-
-spring.flyway.enabled=true
-spring.flyway.user=pdv
-spring.flyway.password=${PDV_FLYWAY_PASSWORD:pdv}
-
-jwt.secret=${JWT_SECRET:dev-secret-key-that-is-at-least-32-bytes-long-for-testing}
-jwt.issuer=pdv
-```
+...
 
 ## Migrations
-- `V1__venda.sql` - Tabelas `venda`, `venda_item`, `venda_pagamento` e RLS inicial (não alterada)
-- `V2__rls_app_user_and_policies.sql` - Cria `pdv_app` (NOSUPERUSER/NOBYPASSRLS), grants, `FORCE ROW LEVEL SECURITY`, políticas com `NULLIF` + `WITH CHECK`
-- `V3__multi_tenant_schema.sql` - Cria `loja`/`caixa`, adiciona `tenant_id` em filhas (preenchido), PK composta `(tenant_id,id)`, FKs compostas, RLS/FORCE em filhas
+
+- `db/control/V1__tenant.sql` - tabela `tenant` no banco de controle.
+- `db/tenant/V1__baseline.sql` - baseline do banco do tenant (loja, caixa, venda, etc).
+- `db/legacy/` - migracoes antigas (RLS) mantidas sem alterar.
 
 ## Testes
-Testes de integração com **Testcontainers PostgreSQL 16** em `MultiTenantSyncIntegrationTest`:
-1. Dois tenants A e B: A grava venda; B não consegue enxergá-la (contexto `app.tenant_id` de B retorna zero linhas)
-2. Mesmo UUID enviado por A e B: ambas `ACEITAS` e separadas (sem `DUPLICADA` indevida)
-3. Reenvio mesmo UUID pelo mesmo tenant: `DUPLICADA`, sem duplicar `venda`, `venda_item`, `venda_pagamento`
-4. Sem `app.tenant_id` definido, role `pdv_app` não vê nenhuma linha
-5. Venda com `lojaId` de outro tenant é `REJEITADA`
-6. Total divergente e pagamento menor que total são `REJEITADAS`
-7. Sem perfil `dev`: `POST /api/auth/token` bloqueado/negado. Com perfil `dev`: funciona
 
-## TODO / Próximos Passos
-- **Login real**: endpoint de autenticação com usuário e senha
-- **Tenant do usuário**: obter `tenant_id` do cadastro do usuário no banco (nunca do cliente)
-- **Refresh token**: implementar rotação/refresh
-- **Autorização por papel**: permissões por operador/caixa
-- **Validação de preço/desconto**: conferir contra tabela de produtos/regras
+Testes de integracao com Testcontainers PostgreSQL 16.
+
+## TODO / Proximos Passos
+
+- Login real com credenciais e tenant do usuario no banco.
+- Refresh token.
+- Tabela de resumo diario `venda_resumo_dia`.
+- Rotacao de MASTER_KEY.
+- PgBouncer.
+- Autorizacao por perfil detalhada.

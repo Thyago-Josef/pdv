@@ -1,10 +1,10 @@
 package br.com.tjosefftech.pdv.config;
 
-import com.nimbusds.jose.jwk.source.ImmutableSecret;
-import com.nimbusds.jose.proc.SecurityContext;
+import br.com.tjosefftech.pdv.tenant.TenantContextFilter;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.Ordered;
 import org.springframework.core.env.Environment;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
@@ -16,6 +16,7 @@ import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
 import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
 
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
@@ -46,7 +47,6 @@ public class SecurityConfig {
                     if (isDev) {
                         auth.requestMatchers("/api/auth/**").permitAll();
                     } else {
-                        // Em produção /api/auth/** não deve ser liberado (endpoint de dev)
                         auth.requestMatchers("/api/auth/**").denyAll();
                     }
                     auth.anyRequest().authenticated();
@@ -57,19 +57,26 @@ public class SecurityConfig {
     }
 
     @Bean
+    public FilterRegistrationBean<TenantContextFilter> tenantContextFilterRegistration(TenantContextFilter filter) {
+        FilterRegistrationBean<TenantContextFilter> registration = new FilterRegistrationBean<>(filter);
+        registration.setOrder(Ordered.HIGHEST_PRECEDENCE);
+        return registration;
+    }
+
+    @Bean
     public JwtEncoder jwtEncoder() {
         if (jwtSecret == null || jwtSecret.getBytes(StandardCharsets.UTF_8).length < 32) {
-            throw new IllegalStateException("jwt.secret deve ter no mínimo 32 bytes. Configure JWT_SECRET.");
+            throw new IllegalStateException("jwt.secret deve ter no minimo 32 bytes. Configure JWT_SECRET.");
         }
         var secretKey = new SecretKeySpec(jwtSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
-        var secret = new ImmutableSecret<SecurityContext>(secretKey);
+        var secret = new com.nimbusds.jose.jwk.source.ImmutableSecret<>(secretKey);
         return new NimbusJwtEncoder(secret);
     }
 
     @Bean
     public JwtDecoder jwtDecoder() {
         if (jwtSecret == null || jwtSecret.getBytes(StandardCharsets.UTF_8).length < 32) {
-            throw new IllegalStateException("jwt.secret deve ter no mínimo 32 bytes. Configure JWT_SECRET.");
+            throw new IllegalStateException("jwt.secret deve ter no minimo 32 bytes. Configure JWT_SECRET.");
         }
         var secretKey = new SecretKeySpec(jwtSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
         return NimbusJwtDecoder.withSecretKey(secretKey)

@@ -10,6 +10,8 @@ import org.springframework.stereotype.Service;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 @Service
@@ -23,9 +25,9 @@ public class TokenService {
         this.issuer = issuer;
     }
 
-    // SOMENTE PARA DESENVOLVIMENTO - Em produção, token vem de login real (usuário/senha),
-    // com tenant_id obtido do cadastro do usuário no banco, nunca enviado pelo cliente.
-    public String gerarToken(UUID tenantId, UUID lojaId) {
+    // SOMENTE PARA DESENVOLVIMENTO - Em producao, token vem de login real (usuario/senha),
+    // com tenant_id obtido do cadastro do usuario no banco, nunca enviado pelo cliente.
+    public String gerarToken(UUID tenantId, String perfil, List<UUID> lojas, UUID lojaId) {
         Instant now = Instant.now();
         Instant exp = now.plus(1, ChronoUnit.HOURS);
 
@@ -34,10 +36,19 @@ public class TokenService {
                 .issuedAt(now)
                 .expiresAt(exp)
                 .subject(tenantId.toString())
-                .claim("tenant_id", tenantId.toString());
+                .claim("tenant_id", tenantId.toString())
+                .claim("perfil", perfil);
 
-        if (lojaId != null) {
-            claimsBuilder.claim("loja_id", lojaId.toString());
+        if (lojas != null && !lojas.isEmpty()) {
+            List<String> lojasClaim = new ArrayList<>();
+            for (UUID l : lojas) {
+                lojasClaim.add(l.toString());
+            }
+            claimsBuilder.claim("lojas", lojasClaim);
+        }
+
+        if ("OPERADOR".equalsIgnoreCase(perfil)) {
+            claimsBuilder.claim("loja_id", lojaId != null ? lojaId.toString() : null);
         }
 
         JwtClaimsSet claims = claimsBuilder.build();
@@ -47,7 +58,7 @@ public class TokenService {
     }
 
     public String gerarToken(UUID tenantId) {
-        return gerarToken(tenantId, null);
+        return gerarToken(tenantId, "OPERADOR", java.util.Collections.emptyList(), null);
     }
 
     public long getExpiresIn() {

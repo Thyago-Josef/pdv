@@ -1,0 +1,11 @@
+CREATE TABLE tenant (
+  id UUID PRIMARY KEY,
+  nome VARCHAR(255) NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'ATIVO' CHECK (status IN ('ATIVO', 'SUSPENSO')),
+  db_host VARCHAR(255) NOT NULL,
+  db_port INTEGER NOT NULL,
+  db_name VARCHAR(255) NOT NULL,
+  db_user VARCHAR(255) NOT NULL,
+  db_password_enc BYTEA NOT NULL,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);

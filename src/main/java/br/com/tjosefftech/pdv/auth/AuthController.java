@@ -8,9 +8,12 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
+import java.util.UUID;
+
 // SOMENTE PARA DESENVOLVIMENTO
-// Em produção, o token deve sair de login real (usuário e senha),
-// com o tenant vindo do cadastro do usuário no banco, nunca de um campo enviado pelo cliente.
+// Em producao, o token deve sair de login real (usuario e senha),
+// com o tenant vindo do cadastro do usuario no banco, nunca de um campo enviado pelo cliente.
 @RestController
 @RequestMapping("/api/auth")
 @Profile("dev")
@@ -24,7 +27,7 @@ public class AuthController {
 
     @PostMapping("/token")
     public TokenResponse gerar(@RequestBody TokenRequest req) {
-        String token = tokenService.gerarToken(req.tenantId(), req.lojaId());
+        String token = tokenService.gerarToken(req.tenantId(), req.perfil(), req.lojas(), req.lojaId());
         return new TokenResponse(token, "Bearer", tokenService.getExpiresIn());
     }
 }

@@ -19,32 +19,28 @@ public class SyncVendaService {
     }
 
     @Transactional
-    public SyncVendasResponse processar(UUID tenantId, UUID lojaIdDoToken, List<VendaDTO> vendas) {
-        // ativa o Row Level Security para esta transação
-        jdbc.queryForObject("select set_config('app.tenant_id', ?, true)", String.class, tenantId.toString());
-
+    public SyncVendasResponse processar(UUID tenantId, UUID lojaIdDoToken, String perfil, List<String> lojasClaim, List<VendaDTO> vendas) {
         List<ResultadoVenda> resultados = new ArrayList<>();
         for (VendaDTO v : vendas) {
-            resultados.add(processarUma(tenantId, lojaIdDoToken, v));
+            resultados.add(processarUma(tenantId, lojaIdDoToken, perfil, lojasClaim, v));
         }
         return new SyncVendasResponse(resultados);
     }
 
-    public SyncVendasResponse processar(UUID tenantId, List<VendaDTO> vendas) {
-        return processar(tenantId, null, vendas);
+    public SyncVendasResponse processar(UUID tenantId, UUID lojaIdDoToken, List<VendaDTO> vendas) {
+        return processar(tenantId, lojaIdDoToken, "OPERADOR", List.of(), vendas);
     }
 
-    private ResultadoVenda processarUma(UUID tenantId, UUID lojaIdDoToken, VendaDTO v) {
-        // Validações básicas
+    private ResultadoVenda processarUma(UUID tenantId, UUID lojaIdDoToken, String perfil, List<String> lojasClaim, VendaDTO v) {
         if (v.itens() == null || v.itens().isEmpty()) {
             return new ResultadoVenda(v.id(), "REJEITADA", "venda sem itens");
         }
         for (ItemDTO i : v.itens()) {
             if (i.quantidade() <= 0) {
-                return new ResultadoVenda(v.id(), "REJEITADA", "quantidade inválida");
+                return new ResultadoVenda(v.id(), "REJEITADA", "quantidade invalida");
             }
             if (i.precoCentavos() < 0) {
-                return new ResultadoVenda(v.id(), "REJEITADA", "preco inválido");
+                return new ResultadoVenda(v.id(), "REJEITADA", "preco invalido");
             }
         }
         if (v.pagamentos() == null || v.pagamentos().isEmpty()) {
@@ -52,13 +48,11 @@ public class SyncVendaService {
         }
         for (PagamentoDTO p : v.pagamentos()) {
             if (p.valorCentavos() < 0) {
-                return new ResultadoVenda(v.id(), "REJEITADA", "pagamento inválido");
+                return new ResultadoVenda(v.id(), "REJEITADA", "pagamento invalido");
             }
         }
 
-        // 1) Nunca confie no cliente: recalcula o total
-        long totalCalculado = v.itens().stream()
-                .mapToLong(i -> i.quantidade() * i.precoCentavos()).sum();
+        long totalCalculado = v.itens().stream().mapToLong(i -> i.quantidade() * i.precoCentavos()).sum();
         if (totalCalculado != v.totalCentavos()) {
             return new ResultadoVenda(v.id(), "REJEITADA", "total divergente: esperado " + totalCalculado);
         }
@@ -67,38 +61,40 @@ public class SyncVendaService {
             return new ResultadoVenda(v.id(), "REJEITADA", "pagamento menor que o total");
         }
 
-        // Valida loja/caixa pertencentes ao tenant
         Integer lojaCount = jdbc.queryForObject(
-                "select count(*) from loja where tenant_id = ? and id = ?",
-                Integer.class, tenantId, v.lojaId());
+                "select count(*) from loja where id = ?",
+                Integer.class, v.lojaId());
         if (lojaCount == null || lojaCount == 0) {
-            return new ResultadoVenda(v.id(), "REJEITADA", "loja não pertence ao tenant");
+            return new ResultadoVenda(v.id(), "REJEITADA", "loja nao pertence ao tenant");
         }
 
         Integer caixaCount = jdbc.queryForObject(
-                "select count(*) from caixa where tenant_id = ? and id = ? and loja_id = ?",
-                Integer.class, tenantId, v.caixaId(), v.lojaId());
+                "select count(*) from caixa where id = ? and loja_id = ?",
+                Integer.class, v.caixaId(), v.lojaId());
         if (caixaCount == null || caixaCount == 0) {
-            return new ResultadoVenda(v.id(), "REJEITADA", "caixa não pertence à loja/tenant");
+            return new ResultadoVenda(v.id(), "REJEITADA", "caixa nao pertence a loja/tenant");
         }
 
-        // Se JWT tiver loja_id, rejeita se diferente
         if (lojaIdDoToken != null && !lojaIdDoToken.equals(v.lojaId())) {
             return new ResultadoVenda(v.id(), "REJEITADA", "loja divergente do token");
         }
 
-        // TODO: conferir preço vs. tabela, limite de desconto, permissão do operador
+        if (lojasClaim != null && !lojasClaim.isEmpty()) {
+            boolean lojaNoEscopo = lojasClaim.stream().anyMatch(l -> l != null && l.equals(v.lojaId().toString()));
+            if (!lojaNoEscopo) {
+                return new ResultadoVenda(v.id(), "REJEITADA", "loja fora do escopo do usuario");
+            }
+        }
 
-        // 2) Idempotência: PK composta (tenant_id, id)
         int inseridas = jdbc.update("""
                 insert into venda (id, tenant_id, loja_id, caixa_id, criada_em, total_centavos)
                 values (?, ?, ?, ?, ?, ?)
-                on conflict (tenant_id, id) do nothing
+                on conflict (id) do nothing
                 """, v.id(), tenantId, v.lojaId(), v.caixaId(),
                 java.sql.Timestamp.from(v.criadaEm()), v.totalCentavos());
 
         if (inseridas == 0) {
-            return new ResultadoVenda(v.id(), "DUPLICADA", null); // já recebida: cliente pode marcar como enviada
+            return new ResultadoVenda(v.id(), "DUPLICADA", null);
         }
 
         v.itens().forEach(i -> jdbc.update(
