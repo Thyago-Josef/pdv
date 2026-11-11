@@ -12,49 +12,6 @@ O `tenant_id` vem exclusivamente do claim `tenant_id` do JWT. O Spring resolve o
 a partir do banco de controle. Nunca aceitar `tenant_id`, loja de outro tenant ou nome de banco
 vindos do corpo, query ou header da requisicao.
 
-## Bancos de Dados
-
-### Banco de Controle (unico, nosso)
-
-- **Nome**: `pdv_control`
-- **Host**: `localhost`
-- **Porta**: `5440`
-- **User**: `postgres`
-- **Password**: `postgres`
-- **Proposito**: registra tenants (`tenant` table) e o mapeamento tenant -> banco.
-
-### Banco de Tenant (por tenant)
-
-- **Nome**: `pdv`
-- **Host**: `localhost`
-- **Porta**: `5440`
-- **User**: `pdv`
-- **Password**: `pdv`
-- **Proposito**: contem lojas, caixas, vendas, etc.
-
-### Docker (PostgreSQL 16)
-
-Container principal:
-```bash
-docker run -d \
-  --name pdv-postgres \
-  -p 5440:5432 \
-  -e POSTGRES_USER=pdv \
-  -e POSTGRES_PASSWORD=pdv \
-  -e POSTGRES_DB=pdv \
-  postgres:16
-```
-
-Criar banco de controle (se necessario):
-```bash
-docker exec -i pdv-postgres psql -U pdv -d pdv -c "CREATE DATABASE pdv_control;"
-```
-
-### pgAdmin
-
-- **Banco de Controle**: host `localhost`, porta `5440`, DB `pdv_control`, user `postgres`, pass `postgres`.
-- **Banco de Tenant**: host `localhost`, porta `5440`, DB `pdv`, user `pdv`, pass `pdv`.
-
 ## Tecnologias
 
 - Java 17
@@ -64,7 +21,79 @@ docker exec -i pdv-postgres psql -U pdv -d pdv -c "CREATE DATABASE pdv_control;"
 - PostgreSQL 16
 - Flyway
 - Testcontainers (testes de integracao)
-- springdoc-openapi (Swagger)
+- springdoc-openapi (Swagger UI)
+
+## Bancos de Dados
+
+| Banco | Container (interno) | Host (maquina) | Porta | Database | Usuario | Senha | Uso |
+|---|---|---|---|---|---|---|---|
+| **Controle** | `pdv-postgres:5432` | `localhost` | `5440` | `pdv_control` | `postgres` | `postgres` | Tabela `tenant`, mapeamento tenant -> banco |
+| **Tenant (dev)** | `pdv-postgres:5432` | `localhost` | `5440` | `pdv` | `postgres` | `postgres` | Lojas, caixas, vendas do tenant em desenvolvimento |
+
+- **`pdv_control`** (banco de controle): criado pelo script `docker/init/01-create-databases.sql` na primeira inicializacao do container. Guarda a tabela `tenant` com status e credenciais de conexao de cada banco de tenant.
+- **`pdv`** (banco de tenant dev): criado automaticamente pelo Postgres via `POSTGRES_DB=pdv`. Usado como banco de tenant padrao para desenvolvimento/testes locais.
+- **Bancos de tenant reais**: em producao, cada tenant tera seu proprio banco (ex.: `tenant_<uuid>`), provisionado pelo servico de provisionamento e registrado em `pdv_control.tenant`.
+
+## Docker
+
+O projeto inclui `docker-compose.yml` para subir o PostgreSQL local com os bancos necessarios.
+
+### Subir o banco
+```bash
+docker compose up -d
+```
+
+Isso cria:
+- container `pdv-postgres` (Postgres 16)
+- volume `pdv_postgres_data` para persistencia
+- database `pdv` (tenant dev)
+- database `pdv_control` (controle) via `docker/init/01-create-databases.sql`
+
+### Comandos uteis
+```bash
+# Ver status do container
+docker compose ps
+
+# Ver logs
+docker compose logs -f postgres
+
+# Parar e remover container (mantem volume)
+docker compose down
+
+# Parar e remover container + volume (apaga dados)
+docker compose down -v
+
+# Listar bancos no container
+docker exec -it pdv-postgres psql -U postgres -c "\l"
+
+# Acessar psql no banco de controle
+docker exec -it pdv-postgres psql -U postgres -d pdv_control
+
+# Acessar psql no banco de tenant (dev)
+docker exec -it pdv-postgres psql -U postgres -d pdv
+```
+
+## Acesso via pgAdmin (local)
+
+Voce pode usar o **pgAdmin instalado localmente** (nao precisa rodar pgAdmin via Docker).
+
+### Conexao - Banco de Controle
+- **Name**: `PDV - Controle`
+- **Host name/address**: `localhost` (ou `127.0.0.1`)
+- **Port**: `5440`
+- **Maintenance database**: `pdv_control`
+- **Username**: `postgres`
+- **Password**: `postgres`
+
+### Conexao - Banco de Tenant (dev)
+- **Name**: `PDV - Tenant Dev`
+- **Host name/address**: `localhost` (ou `127.0.0.1`)
+- **Port**: `5440`
+- **Maintenance database**: `pdv`
+- **Username**: `postgres`
+- **Password**: `postgres`
+
+> Se o pgAdmin estiver rodando **dentro de outro container Docker**, use `host.docker.internal` no host (em vez de `localhost`) e garanta que a porta `5440` esteja publicada.
 
 ## Arquitetura
 
@@ -111,7 +140,7 @@ Sem RLS neste banco.
 - `POST /api/auth/token` (somente `@Profile("dev")`).
 - Recebe `tenantId`, `perfil` (ADMIN|GERENTE|OPERADOR) e `lojas` (lista de UUIDs), emite JWT com
   claims `tenant_id`, `perfil`, `lojas`, e opcionalmente `loja_id`/`caixa_id` para OPERADOR.
-- Em producao o token vem de login real (usuario e senha); tenant e escopo vêm do cadastro do usuário.
+- Em producao o token vem de login real (usuario e senha); tenant e escopo vêm do cadastro do usuario.
 
 ### 5) Sincronizacao de Vendas
 
@@ -143,20 +172,28 @@ RLS foi removido. Isolamento via banco por tenant + validacoes no sync.
 
 ### Variaveis de ambiente
 
-| Variavel | Descricao | Padrao |
+| Variavel | Descricao | Padrao (dev) |
 |---|---|---|
-| `JWT_SECRET` | Chave para assinar/verificar JWT HS256 (min 32 bytes) | vazio (dev usa default) |
+| `JWT_SECRET` | Chave para assinar/verificar JWT HS256 (min 32 bytes) | dev-secret-key-that-is-at-least-32-bytes-long-for-testing |
 | `MASTER_KEY` | Chave mestra AES-GCM (control) | - |
-| `CONTROL_DB_URL` | JDBC do banco de controle | jdbc:postgresql://localhost:5440/pdv_control |
-| `CONTROL_DB_USER` / `CONTROL_DB_PASSWORD` | Credenciais admin de provisionamento | postgres / postgres |
-| `PDV_APP_PASSWORD` | Senha do role `pdv_app` do tenant | pdv_app |
-| `PDV_FLYWAY_USER` / `PDV_FLYWAY_PASSWORD` | Usuarios Flyway | pdv / pdv |
+| `CONTROL_DB_URL` | JDBC do banco de controle | `jdbc:postgresql://localhost:5440/pdv_control` |
+| `CONTROL_DB_USER` | Usuario do banco de controle | `postgres` |
+| `CONTROL_DB_PASSWORD` | Senha do banco de controle | `postgres` |
+| `PDV_APP_PASSWORD` | Senha do role `pdv_app` do tenant | `pdv_app` |
+| `PDV_FLYWAY_USER` | Usuario Flyway | `pdv` |
+| `PDV_FLYWAY_PASSWORD` | Senha Flyway | `pdv` |
 
 ### application.properties (padrao / producao)
-...
+- `app.control.datasource.*`: conecta no banco de controle (`pdv_control`).
+- `spring.datasource.*`: datasource padrao/tenant (roteado).
 
 ### application-dev.properties (desenvolvimento)
-...
+- Perfil `dev`: ativa endpoint `/api/auth/token` e usa segredo JWT de desenvolvimento (sobrescrevivel por `JWT_SECRET`).
+
+## Swagger / OpenAPI
+
+- **Swagger UI**: `http://localhost:8080/swagger-ui.html`
+- **OpenAPI JSON**: `http://localhost:8080/v3/api-docs`
 
 ## Migrations
 
