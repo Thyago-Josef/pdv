@@ -12,6 +12,49 @@ O `tenant_id` vem exclusivamente do claim `tenant_id` do JWT. O Spring resolve o
 a partir do banco de controle. Nunca aceitar `tenant_id`, loja de outro tenant ou nome de banco
 vindos do corpo, query ou header da requisicao.
 
+## Bancos de Dados
+
+### Banco de Controle (unico, nosso)
+
+- **Nome**: `pdv_control`
+- **Host**: `localhost`
+- **Porta**: `5440`
+- **User**: `postgres`
+- **Password**: `postgres`
+- **Proposito**: registra tenants (`tenant` table) e o mapeamento tenant -> banco.
+
+### Banco de Tenant (por tenant)
+
+- **Nome**: `pdv`
+- **Host**: `localhost`
+- **Porta**: `5440`
+- **User**: `pdv`
+- **Password**: `pdv`
+- **Proposito**: contem lojas, caixas, vendas, etc.
+
+### Docker (PostgreSQL 16)
+
+Container principal:
+```bash
+docker run -d \
+  --name pdv-postgres \
+  -p 5440:5432 \
+  -e POSTGRES_USER=pdv \
+  -e POSTGRES_PASSWORD=pdv \
+  -e POSTGRES_DB=pdv \
+  postgres:16
+```
+
+Criar banco de controle (se necessario):
+```bash
+docker exec -i pdv-postgres psql -U pdv -d pdv -c "CREATE DATABASE pdv_control;"
+```
+
+### pgAdmin
+
+- **Banco de Controle**: host `localhost`, porta `5440`, DB `pdv_control`, user `postgres`, pass `postgres`.
+- **Banco de Tenant**: host `localhost`, porta `5440`, DB `pdv`, user `pdv`, pass `pdv`.
+
 ## Tecnologias
 
 - Java 17
@@ -21,6 +64,7 @@ vindos do corpo, query ou header da requisicao.
 - PostgreSQL 16
 - Flyway
 - Testcontainers (testes de integracao)
+- springdoc-openapi (Swagger)
 
 ## Arquitetura
 
@@ -67,7 +111,7 @@ Sem RLS neste banco.
 - `POST /api/auth/token` (somente `@Profile("dev")`).
 - Recebe `tenantId`, `perfil` (ADMIN|GERENTE|OPERADOR) e `lojas` (lista de UUIDs), emite JWT com
   claims `tenant_id`, `perfil`, `lojas`, e opcionalmente `loja_id`/`caixa_id` para OPERADOR.
-- Em producao o token vem de login real (usuário e senha); tenant e escopo vêm do cadastro do usuário.
+- Em producao o token vem de login real (usuario e senha); tenant e escopo vêm do cadastro do usuário.
 
 ### 5) Sincronizacao de Vendas
 
